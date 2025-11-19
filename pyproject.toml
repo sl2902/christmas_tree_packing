@@ -1,0 +1,18 @@
+[project]
+name = "christmas_tree_packing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "loguru>0.7.0",
+    "pandas==2.3.3",
+    "shapely==2.1.2",
+    "matplotlib==3.10.7",
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+
+[tool.poetry]
+package-mode = false
