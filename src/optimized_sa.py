@@ -1,450 +1,503 @@
-// src/main.rs
-// Rust SA using the only proven accurate method: O(N^2) brute-force geometric check.
-// This guarantees best_score matches the final validation.
+"""
+Optimized Simulated Annealing for tree packing.
 
-use geo::{Coord, LineString, Polygon, BoundingRect};
-use geo::algorithm::intersects::Intersects;
-use geo::algorithm::rotate::Rotate;
-use rand::prelude::*;
-use rand_distr::{Distribution, Normal};
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use clap::Parser;
-use std::time::Instant;
+Implements all best practices:
+- Fast iteration loop
+- Incremental collision checking (O(N) not O(N²))
+- Exponential cooling schedule
+- Multiple neighborhood moves
+- Best solution tracking
+- Multiple random seeds
 
-// --- GEOMETRY DEFINITIONS ---
+Usage:
+    python optimized_sa.py --n 5 --iterations 100000 --trials 10
+    python optimized_sa.py --full-submission --output ../submissions/sa_submission.csv
+"""
+import sys
+from pathlib import Path
+import numpy as np
+import random
+import time
+from loguru import logger
+import argparse
 
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-struct Args {
-    /// Test single n value
-    #[arg(short, long)]
-    n: Option<usize>,
-    
-    /// Start from this n
-    #[arg(long)]
-    start_n: Option<usize>,
-    
-    /// Number of iterations
-    #[arg(long, default_value_t = 50000)]
-    iterations: usize,
-    
-    /// Number of trials per n
-    #[arg(long, default_value_t = 5)]
-    trials: usize,
-    
-    /// Output CSV file
-    #[arg(long)]
-    output: Option<String>,
-    
-    /// Verbose output
-    #[arg(short, long)]
-    verbose: bool,
-    
-    /// Full submission (n=1-200)
-    #[arg(long)]
-    full_submission: bool,
-}
+sys.path.insert(0, str(Path(__file__).parent))
 
-// Christmas tree geometry
-fn create_tree_polygon(center_x: f64, center_y: f64, angle_deg: f64) -> Polygon<f64> {
-    let trunk_w = 0.15;
-    let trunk_h = 0.2;
-    let base_w = 0.7;
-    let mid_w = 0.4;
-    let top_w = 0.25;
-    let tip_y = 0.8;
-    let tier1 = 0.5;
-    let tier2 = 0.25;
-    let trunk_b = -trunk_h;
-    
-    let points = vec![
-        (0.0, tip_y),
-        (top_w/2.0, tier1), (top_w/4.0, tier1),
-        (mid_w/2.0, tier2), (mid_w/4.0, tier2),
-        (base_w/2.0, 0.0),
-        (trunk_w/2.0, 0.0), (trunk_w/2.0, trunk_b),
-        (-trunk_w/2.0, trunk_b), (-trunk_w/2.0, 0.0),
-        (-base_w/2.0, 0.0),
-        (-mid_w/4.0, tier2), (-mid_w/2.0, tier2),
-        (-top_w/4.0, tier1), (-top_w/2.0, tier1),
-    ];
-    
-    let coords: Vec<Coord<f64>> = points.iter().map(|&(x, y)| Coord { x, y }).collect();
-    let mut poly = Polygon::new(LineString::from(coords), vec![]);
-    poly = poly.rotate_around_point(angle_deg, geo::Point::new(0.0, 0.0));
-    
-    let translated: Vec<Coord<f64>> = poly.exterior().coords()
-        .map(|c| Coord { x: c.x + center_x, y: c.y + center_y })
-        .collect();
-    
-    Polygon::new(LineString::from(translated), vec![])
-}
+from tree_geometry import ChristmasTree
+from utils import calculate_bounding_square, calculate_total_score, export_submission
+from shapely.strtree import STRtree
 
-#[derive(Clone)]
-struct Tree {
-    x: f64,
-    y: f64,
-    angle: f64,
-    polygon: Polygon<f64>,
-}
 
-impl Tree {
-    fn new(x: f64, y: f64, angle: f64) -> Self {
-        let polygon = create_tree_polygon(x, y, angle);
-        Tree { x, y, angle, polygon }
-    }
-}
-
-fn bounding_square(trees: &[Tree]) -> f64 {
-    let mut min_x = f64::INFINITY;
-    let mut max_x = f64::NEG_INFINITY;
-    let mut min_y = f64::INFINITY;
-    let mut max_y = f64::NEG_INFINITY;
+class FastTreePacker:
+    """Fast simulated annealing for tree packing."""
     
-    for tree in trees {
-        if let Some(rect) = tree.polygon.bounding_rect() {
-            min_x = min_x.min(rect.min().x);
-            max_x = max_x.max(rect.max().x);
-            min_y = min_y.min(rect.min().y);
-            max_y = max_y.max(rect.max().y);
-        }
-    }
+    def __init__(self, n, seed=42):
+        self.n = n
+        random.seed(seed)
+        np.random.seed(seed)
+        
+        # State: positions and angles
+        self.positions = np.zeros((n, 2), dtype=np.float64)
+        self.angles = np.zeros(n, dtype=np.float64)
+        
+        # Initialize randomly in small area
+        radius = 2.0
+        for i in range(n):
+            r = radius * np.sqrt(random.random())
+            theta = 2 * np.pi * random.random()
+            self.positions[i, 0] = r * np.cos(theta)
+            self.positions[i, 1] = r * np.sin(theta)
+            self.angles[i] = random.random() * 360
+        
+        # Trees cache
+        self.trees = self._create_trees()
+        self.current_score = self._calculate_score()
+        
+        # Best solution tracking
+        self.best_positions = self.positions.copy()
+        self.best_angles = self.angles.copy()
+        self.best_score = self.current_score
     
-    (max_x - min_x).max(max_y - min_y)
-}
-
-// The only accurate score function (O(N^2) brute-force)
-fn calculate_accurate_score(trees: &[Tree], n: usize) -> f64 {
-    use geo::algorithm::area::Area;
-    use geo::algorithm::bool_ops::BooleanOps;
-    use geo::algorithm::relate::Relate;
+    def _create_trees(self):
+        """Create tree objects from current state."""
+        trees = []
+        for i in range(self.n):
+            tree = ChristmasTree(
+                str(self.positions[i, 0]),
+                str(self.positions[i, 1]),
+                str(self.angles[i])
+            )
+            trees.append(tree)
+        return trees
     
-    let mut penalty = 0.0;
+    def _calculate_score(self):
+        """Calculate score for current configuration."""
+        trees = self._create_trees()
+        
+        # Check overlaps (penalty)
+        penalty = 0.0
+        polygons = [t.polygon for t in trees]
+        tree_index = STRtree(polygons)
+        
+        for i, poly in enumerate(polygons):
+            indices = tree_index.query(poly)
+            for idx in indices:
+                if idx <= i:
+                    continue
+                if poly.intersects(polygons[idx]) and not poly.touches(polygons[idx]):
+                    # Heavy penalty for overlaps
+                    overlap_area = poly.intersection(polygons[idx]).area / 1e30
+                    penalty += overlap_area * 1000
+        
+        # Bounding square
+        side = calculate_bounding_square(trees)
+        base_score = float(side ** 2) / self.n
+        
+        return base_score + penalty
     
-    // Check ALL pairs for collision (O(N^2))
-    for i in 0..trees.len() {
-        for j in (i+1)..trees.len() {
-            let intersects = trees[i].polygon.intersects(&trees[j].polygon);
-            let touches = trees[i].polygon.relate(&trees[j].polygon).is_touches();
+    def _calculate_score_after_move(self, tree_idx, new_pos, new_angle):
+        """
+        Calculate score after moving one tree.
+        OPTIMIZED: Only check collisions for moved tree (O(N) not O(N²))
+        """
+        # Temporarily update
+        old_pos = self.positions[tree_idx].copy()
+        old_angle = self.angles[tree_idx]
+        
+        self.positions[tree_idx] = new_pos
+        self.angles[tree_idx] = new_angle
+        
+        # Create trees
+        trees = self._create_trees()
+        
+        # Check overlaps - only for moved tree
+        penalty = 0.0
+        moved_poly = trees[tree_idx].polygon
+        
+        for i in range(self.n):
+            if i == tree_idx:
+                continue
             
-            if intersects && !touches {
-                let intersection = trees[i].polygon.intersection(&trees[j].polygon);
-                let overlap_area = intersection.unsigned_area();
-                penalty += overlap_area * 1000.0;
-            }
-        }
-    }
-    
-    // Calculate bounding square with ALL trees
-    let side = bounding_square(trees);
-    (side * side) / (n as f64) + penalty
-}
-
-fn count_overlaps(trees: &[Tree]) -> usize {
-    use geo::algorithm::relate::Relate;
-    let mut count = 0;
-    for i in 0..trees.len() {
-        for j in (i+1)..trees.len() {
-            let intersects = trees[i].polygon.intersects(&trees[j].polygon);
-            let touches = trees[i].polygon.relate(&trees[j].polygon).is_touches();
-            if intersects && !touches {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-// --- SIMULATED ANNEALING ---
-
-fn simulated_annealing(n: usize, iterations: usize, seed: u64, verbose: bool) -> (Vec<Tree>, f64) {
-    let mut rng = StdRng::seed_from_u64(seed);
-    
-    // Initialization
-    let radius = 2.0;
-    let mut trees: Vec<Tree> = (0..n)
-        .map(|_| {
-            let r = radius * rng.gen::<f64>().sqrt();
-            let theta = 2.0 * std::f64::consts::PI * rng.gen::<f64>();
-            let x = r * theta.cos();
-            let y = r * theta.sin();
-            let angle = rng.gen::<f64>() * 360.0;
-            Tree::new(x, y, angle)
-        })
-        .collect();
-    
-    let mut best_trees = trees.clone();
-    let mut best_positions: Vec<(f64, f64, f64)> = trees.iter()
-        .map(|t| (t.x, t.y, t.angle))
-        .collect();
-    
-    // Use the only reliable score calculation
-    let initial_score = calculate_accurate_score(&trees, n);
-    
-    let mut best_score = initial_score;
-    let mut current_score = initial_score;
-    
-    // Temperature schedule (matching Python: T0=10.0, T1=0.01)
-    let t0: f64 = 10.0;
-    let t1: f64 = 0.01;
-    
-    if verbose {
-        eprintln!("  Initial score: {:.6}", current_score);
-        eprintln!("  Bounding square: {:.6}", bounding_square(&trees));
-    }
-    
-    let mut accepts = 0;
-    
-    for iter in 0..iterations {
-        let progress = iter as f64 / iterations as f64;
-        // Strict exponential cooling schedule (no tuning factor)
-        let temperature = t0 * (t1 / t0).powf(progress);
+            other_poly = trees[i].polygon
+            if moved_poly.intersects(other_poly) and not moved_poly.touches(other_poly):
+                overlap_area = moved_poly.intersection(other_poly).area / 1e30
+                penalty += overlap_area * 1000
         
-        let tree_idx = rng.gen_range(0..n);
-        let old_tree = trees[tree_idx].clone();
+        # Bounding square
+        side = calculate_bounding_square(trees)
+        score = float(side ** 2) / self.n + penalty
         
-        // Random move (Gaussian/Uniform logic)
-        let move_type = rng.gen_range(0..3);
-        let (new_x, new_y, new_angle) = match move_type {
-            0 => {
-                // Translate (GAUSSIAN)
-                let step_size = 0.5 * (1.0 - progress * 0.8);
-                let normal = Normal::new(0.0, step_size).unwrap();
-                let dx = normal.sample(&mut rng);
-                let dy = normal.sample(&mut rng);
-                (old_tree.x + dx, old_tree.y + dy, old_tree.angle)
-            },
-            1 => {
-                // Rotate (UNIFORM)
-                let angle_step = 30.0 * (1.0 - progress * 0.8);
-                let da = rng.gen::<f64>() * 2.0 * angle_step - angle_step; 
-                (old_tree.x, old_tree.y, (old_tree.angle + da) % 360.0)
-            },
-            _ => {
-                // Both (GAUSSIAN for position, UNIFORM for angle)
-                let step_size = 0.3 * (1.0 - progress * 0.8);
-                let normal = Normal::new(0.0, step_size).unwrap();
-                let dx = normal.sample(&mut rng);
-                let dy = normal.sample(&mut rng);
+        # Restore
+        self.positions[tree_idx] = old_pos
+        self.angles[tree_idx] = old_angle
+        
+        return score
+    
+    def _get_temperature(self, progress, T0=10.0, T1=0.01):
+        """
+        Exponential cooling schedule.
+        progress: 0.0 to 1.0
+        Returns: temperature
+        """
+        return T0 * (T1 / T0) ** progress
+    
+    def _accept_move(self, delta, temperature):
+        """Acceptance probability for SA."""
+        if delta < 0:
+            return True  # Always accept improvements
+        return random.random() < np.exp(-delta / temperature)
+    
+    def optimize(self, max_iterations=100000, T0=10.0, T1=0.01, verbose=True):
+        """
+        Run simulated annealing optimization.
+        
+        Args:
+            max_iterations: Number of iterations
+            T0: Initial temperature
+            T1: Final temperature
+            verbose: Print progress
+        """
+        if verbose:
+            logger.info(f"SA optimization: n={self.n}, iterations={max_iterations}")
+            logger.info(f"  Initial score: {self.current_score:.6f}")
+        
+        for iteration in range(max_iterations):
+            progress = iteration / max_iterations
+            temperature = self._get_temperature(progress, T0, T1)
+            
+            # Choose move type randomly
+            move_type = random.choice(['translate', 'rotate', 'both'])
+            
+            # Select random tree
+            tree_idx = random.randint(0, self.n - 1)
+            
+            # Generate neighbor
+            if move_type == 'translate':
+                # Move position
+                step_size = 0.5 * (1 - progress * 0.8)  # Decrease step size over time
+                delta = np.random.randn(2) * step_size
+                new_pos = self.positions[tree_idx] + delta
+                new_angle = self.angles[tree_idx]
                 
-                let angle_step = 20.0 * (1.0 - progress * 0.8);
-                let da = rng.gen::<f64>() * 2.0 * angle_step - angle_step;
-                (old_tree.x + dx, old_tree.y + dy, (old_tree.angle + da) % 360.0)
-            }
-        };
-        
-        // Update tree temporarily
-        trees[tree_idx] = Tree::new(new_x, new_y, new_angle);
-        
-        // Calculate new score using the ACCURATE O(N^2) check
-        let new_score = calculate_accurate_score(&trees, n);
-        
-        let delta = new_score - current_score;
-        
-        // Accept or reject
-        if delta < 0.0 || rng.gen::<f64>() < (-delta / temperature).exp() {
-            accepts += 1;
-            current_score = new_score;
-            if new_score < best_score {
-                best_score = new_score;
-                // Save current positions/angles
-                for i in 0..trees.len() {
-                    best_positions[i] = (trees[i].x, trees[i].y, trees[i].angle);
-                }
-            }
-        } else {
-            // Restore old tree
-            trees[tree_idx] = old_tree;
-        }
-        
-        if verbose && iter > 0 && iter % 10000 == 0 {
-            let accept_rate = accepts as f64 / iter as f64;
-            let overlaps = count_overlaps(&trees);
-            eprintln!("  Iter {:6}: T={:.4}, current={:.6}, best={:.6}, accept={:.3}, overlaps={}", 
-                      iter, temperature, current_score, best_score, accept_rate, overlaps);
-        }
-    }
-    
-    // Reconstruct best_trees from saved positions
-    for i in 0..best_positions.len() {
-        let (x, y, angle) = best_positions[i];
-        best_trees[i] = Tree::new(x, y, angle);
-    }
-    
-    if verbose {
-        eprintln!("  Final best score: {:.6}", best_score);
-        
-        // Final validation using the ACCURATE O(N^2) score check
-        let validation_score = calculate_accurate_score(&best_trees, n);
-        
-        // Recalculate overlap count
-        let overlap_count = count_overlaps(&best_trees);
-        let side = bounding_square(&best_trees);
-        
-        eprintln!("  VALIDATION: {} overlaps, side={:.6}", overlap_count, side); 
-        
-        eprintln!("  VALIDATION: Recalculated score = {:.6}", validation_score);
-        if (validation_score - best_score).abs() > 0.001 {
-            eprintln!("  WARNING: Score mismatch! best_score={:.6} but validation={:.6}", 
-                      best_score, validation_score);
-        }
-    }
-    
-    (best_trees, best_score)
-}
-
-// --- MAIN EXECUTION ---
-
-fn optimize_with_trials(n: usize, iterations: usize, trials: usize, verbose: bool) -> (Vec<Tree>, f64) {
-    if verbose {
-        eprintln!("{}", "=".repeat(80));
-        eprintln!("OPTIMIZED SIMULATED ANNEALING: n={}, trials={}", n, trials);
-        eprintln!("{}", "=".repeat(80));
-        eprintln!();
-    }
-    
-    let mut best_trees = Vec::new();
-    let mut best_score = f64::INFINITY;
-    
-    for trial in 0..trials {
-        if verbose {
-            eprintln!("Trial {}/{}", trial + 1, trials);
-        }
-        
-        // Using a different seed for each trial
-        let (trees, score) = simulated_annealing(n, iterations, 42 + trial as u64, verbose);
-        
-        if score < best_score {
-            best_score = score;
-            best_trees = trees;
-        }
-        
-        if verbose {
-            eprintln!();
-        }
-    }
-    
-    if verbose {
-        eprintln!("{}", "=".repeat(80));
-        eprintln!("BEST SCORE ACROSS {} TRIALS: {:.6}", trials, best_score);
-        eprintln!("{}", "=".repeat(80));
-        eprintln!();
-    }
-    
-    (best_trees, best_score)
-}
-
-fn main() -> std::io::Result<()> {
-    let args = Args::parse();
-    
-    // Determine range
-    let (start_n, end_n) = if let Some(n) = args.n {
-        (n, n)
-    } else if args.full_submission {
-        (1, 200)
-    } else if let Some(start) = args.start_n {
-        (start, 200)
-    } else {
-        eprintln!("Error: Must specify --n, --full-submission, or --start-n");
-        eprintln!();
-        eprintln!("Examples:");
-        eprintln!("  Test n=5:           cargo run --release -- --n 5");
-        eprintln!("  Full submission:    cargo run --release -- --full-submission");
-        eprintln!("  Continue from n=77: cargo run --release -- --start-n 77");
-        std::process::exit(1);
-    };
-    
-    // Generate dynamic output filename if not specified
-    let output = if let Some(out) = args.output {
-        out
-    } else {
-        if args.n.is_some() {
-            format!("./submissions/rust_sa_i{}_t{}_n{}.csv", 
-                    args.iterations, args.trials, args.n.unwrap())
-        } else if args.full_submission {
-            format!("./submissions/rust_sa_i{}_t{}_n1-200.csv", 
-                    args.iterations, args.trials)
-        } else {
-            format!("./submissions/rust_sa_i{}_t{}_n{}-200.csv", 
-                    args.iterations, args.trials, start_n)
-        }
-    };
-    
-    // Create output directory if needed
-    if let Some(parent) = std::path::Path::new(&output).parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-    
-    if !args.verbose {
-        eprintln!("{}", "=".repeat(80));
-        eprintln!("RUST SIMULATED ANNEALING (O(N^2) ACCURATE)");
-        eprintln!("{}", "=".repeat(80));
-        eprintln!();
-    }
-    
-    let start_time = Instant::now();
-    let mut all_tree_data: Vec<(f64, f64, f64)> = Vec::new();
-    
-    for n in start_n..=end_n {
-        let iters = args.iterations;
-        
-        if !args.verbose {
-            eprintln!("Optimizing n={} ({} iterations, {} trials)...", n, iters, args.trials);
-        }
-        
-        let (trees, score) = optimize_with_trials(n, iters, args.trials, args.verbose);
-        
-        for tree in &trees {
-            all_tree_data.push((tree.x, tree.y, tree.angle));
-        }
-        
-        if !args.verbose {
-            eprintln!("  Final score: {:.6}", score);
+            elif move_type == 'rotate':
+                # Rotate
+                angle_step = 30 * (1 - progress * 0.8)
+                delta_angle = random.uniform(-angle_step, angle_step)
+                new_pos = self.positions[tree_idx].copy()
+                new_angle = (self.angles[tree_idx] + delta_angle) % 360
+                
+            else:  # both
+                # Both translate and rotate
+                step_size = 0.3 * (1 - progress * 0.8)
+                delta = np.random.randn(2) * step_size
+                new_pos = self.positions[tree_idx] + delta
+                angle_step = 20 * (1 - progress * 0.8)
+                delta_angle = random.uniform(-angle_step, angle_step)
+                new_angle = (self.angles[tree_idx] + delta_angle) % 360
             
-            if n % 5 == 0 {
-                let elapsed = start_time.elapsed().as_secs();
-                let n_processed = n - start_n + 1;
-                let time_per_n = elapsed as f64 / n_processed as f64;
-                let estimated_remaining_secs = (end_n - n) as f64 * time_per_n;
-                eprintln!("  Time elapsed: {} min", elapsed / 60);
-                eprintln!("  Estimated remaining: {:.1} min", estimated_remaining_secs / 60.0);
-            }
-            eprintln!();
-        }
-    }
+            # Calculate new score (O(N) collision check)
+            new_score = self._calculate_score_after_move(tree_idx, new_pos, new_angle)
+            
+            # Accept or reject
+            delta_score = new_score - self.current_score
+            
+            if self._accept_move(delta_score, temperature):
+                # Accept move
+                self.positions[tree_idx] = new_pos
+                self.angles[tree_idx] = new_angle
+                self.current_score = new_score
+                
+                # Update best
+                if new_score < self.best_score:
+                    self.best_score = new_score
+                    self.best_positions = self.positions.copy()
+                    self.best_angles = self.angles.copy()
+            
+            # Progress logging
+            if verbose and iteration % 10000 == 0:
+                logger.info(f"  Iter {iteration:6d}: T={temperature:.4f}, "
+                           f"current={self.current_score:.6f}, best={self.best_score:.6f}")
+        
+        # Restore best solution
+        self.positions = self.best_positions.copy()
+        self.angles = self.best_angles.copy()
+        self.current_score = self.best_score
+        
+        if verbose:
+            logger.info(f"  Final best score: {self.best_score:.6f}")
+        
+        return self.best_score
     
-    // Export CSV
-    let file = File::create(&output)?;
-    let mut writer = BufWriter::new(file);
-    writeln!(writer, "id,x,y,rotation")?;
+    def get_trees(self):
+        """Get final tree configuration."""
+        return self._create_trees()
+
+
+def optimize_with_multiple_trials(n, iterations=100000, trials=10, verbose=True):
+    """
+    Run SA multiple times with different seeds and keep best.
     
-    let mut idx = 0;
-    for n in start_n..=end_n {
-        for i in 0..n {
-            let (x, y, angle) = all_tree_data[idx];
-            writeln!(writer, "{:03}_{},s{:.6},s{:.6},s{:.1}", n, i, x, y, angle)?;
-            idx += 1;
-        }
-    }
+    Args:
+        n: Number of trees
+        iterations: Iterations per trial
+        trials: Number of random trials
+        verbose: Print progress
     
-    let elapsed = start_time.elapsed();
-    eprintln!();
-    eprintln!("{}", "=".repeat(80));
-    eprintln!("FINAL RESULTS");
-    eprintln!("{}", "=".repeat(80));
-    eprintln!("Total time: {:.1} minutes", elapsed.as_secs_f64() / 60.0);
-    eprintln!("✓ Saved to: {}", output);
+    Returns:
+        Tuple of (best_trees, best_score)
+    """
+    if verbose:
+        logger.info("="*80)
+        logger.info(f"OPTIMIZED SIMULATED ANNEALING: n={n}, trials={trials}")
+        logger.info("="*80)
+        logger.info("")
     
-    // If single n test, show tree positions
-    if let Some(n) = args.n {
-        eprintln!();
-        eprintln!("Tree positions:");
-        for i in 0..n {
-            let (x, y, angle) = all_tree_data[i];
-            eprintln!("  {:03}_{},s{:.6},s{:.6},s{:.1}", n, i, x, y, angle);
-        }
-    }
+    best_overall_trees = None
+    best_overall_score = float('inf')
     
-    Ok(())
-}
+    for trial in range(trials):
+        if verbose:
+            logger.info(f"Trial {trial + 1}/{trials}")
+        
+        packer = FastTreePacker(n, seed=42 + trial)
+        score = packer.optimize(max_iterations=iterations, verbose=verbose)
+        trees = packer.get_trees()
+        
+        if score < best_overall_score:
+            best_overall_score = score
+            best_overall_trees = trees
+        
+        if verbose:
+            logger.info("")
+    
+    if verbose:
+        logger.info("="*80)
+        logger.info(f"BEST SCORE ACROSS {trials} TRIALS: {best_overall_score:.6f}")
+        logger.info("="*80)
+        logger.info("")
+    
+    return best_overall_trees, best_overall_score
+
+
+def generate_sa_submission(output_csv, 
+                           iterations_small=100000,
+                           iterations_large=50000,
+                           trials=5,
+                           checkpoint_file=None,
+                           verbose=True):
+    """
+    Generate full submission using optimized SA with checkpointing.
+    
+    Args:
+        output_csv: Output path
+        iterations_small: Iterations for n <= 20
+        iterations_large: Iterations for n > 20
+        trials: Trials per n
+        checkpoint_file: Path to checkpoint file (auto-created if None)
+        verbose: Print progress
+    """
+    # Setup checkpoint
+    if checkpoint_file is None:
+        checkpoint_file = output_csv.replace('.csv', '_checkpoint.pkl')
+    
+    # Try to load checkpoint
+    checkpoint_data = None
+    if Path(checkpoint_file).exists():
+        try:
+            import pickle
+            with open(checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            if verbose:
+                logger.info(f" Loaded checkpoint from: {checkpoint_file}")
+                logger.info(f"  Resuming from n={checkpoint_data['last_n'] + 1}")
+                logger.info("")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}")
+            checkpoint_data = None
+    
+    if verbose:
+        logger.info("="*80)
+        logger.info("OPTIMIZED SIMULATED ANNEALING SUBMISSION")
+        if checkpoint_data:
+            logger.info("(RESUMING FROM CHECKPOINT)")
+        logger.info("="*80)
+        logger.info("")
+    
+    # Initialize or restore from checkpoint
+    if checkpoint_data:
+        all_tree_data = checkpoint_data['all_tree_data']
+        side_lengths = checkpoint_data['side_lengths']
+        start_n = checkpoint_data['last_n'] + 1
+        start_time = time.time() - checkpoint_data['elapsed_time']
+    else:
+        all_tree_data = []
+        side_lengths = []
+        start_n = 1
+        start_time = time.time()
+    
+    for n in range(start_n, 201):
+        # More iterations for small n
+        iters = iterations_small if n <= 20 else iterations_large
+        
+        if verbose:
+            logger.info(f"Optimizing n={n} ({iters} iterations, {trials} trials)...")
+        
+        trees, score = optimize_with_multiple_trials(
+            n, 
+            iterations=iters,
+            trials=trials,
+            verbose=False  # Don't spam logs
+        )
+        
+        side = calculate_bounding_square(trees)
+        side_lengths.append(side)
+        
+        for tree in trees:
+            all_tree_data.append([tree.center_x, tree.center_y, tree.angle])
+        
+        if verbose:
+            logger.info(f"  Final score: {score:.6f}")
+            
+            if n % 5 == 0:
+                elapsed = time.time() - start_time
+                current_score = calculate_total_score(side_lengths)
+                logger.info(f"  Cumulative score: {current_score:.6f}")
+                logger.info(f"  Time elapsed: {elapsed/60:.1f} min")
+                logger.info(f"  Estimated remaining: {(200-n) * (elapsed/n) / 60:.1f} min")
+            logger.info("")
+        
+        # Save checkpoint every 5 configs
+        if n % 5 == 0:
+            # try:
+            #     import pickle
+            #     checkpoint = {
+            #         'last_n': n,
+            #         'all_tree_data': all_tree_data,
+            #         'side_lengths': side_lengths,
+            #         'elapsed_time': time.time() - start_time
+            #     }
+            #     with open(checkpoint_file, 'wb') as f:
+            #         pickle.dump(checkpoint, f)
+            #     if verbose:
+            #         logger.info(f"  Checkpoint saved")
+            #         logger.info("")
+            # except Exception as e:
+            #     logger.warning(f"Failed to save checkpoint: {e}")
+            try:
+                import pickle
+                checkpoint = {
+                    'last_n': n,
+                    'all_tree_data': all_tree_data,
+                    'side_lengths': side_lengths,
+                    'elapsed_time': time.time() - start_time
+                }
+                with open(checkpoint_file, 'wb') as f:
+                    pickle.dump(checkpoint, f)
+                if verbose:
+                    logger.info(f"  Checkpoint saved")
+                    
+                # Backup to persistent storage
+                try:
+                    import os
+                    
+                    # Kaggle
+                    if 'KAGGLE_KERNEL_RUN_TYPE' in os.environ:
+                        output_dir = Path('/kaggle/working')
+                        if output_dir.exists():
+                            import shutil
+                            backup_path = output_dir / Path(checkpoint_file).name
+                            shutil.copy(checkpoint_file, backup_path)
+                            logger.info(f"  ✓ Backed up to {backup_path}")
+                    
+                    # Colab with Google Drive
+                    elif 'COLAB_GPU' in os.environ or os.path.exists('/content'):
+                        gdrive_path = Path('/content/drive/MyDrive/kaggle_checkpoints')
+                        if gdrive_path.exists():
+                            import shutil
+                            backup_path = gdrive_path / Path(checkpoint_file).name
+                            shutil.copy(checkpoint_file, backup_path)
+                            logger.info(f"  ✓ Backed up to Google Drive: {backup_path}")
+                except:
+                    pass
+                    
+                logger.info("")
+            except Exception as e:
+                logger.warning(f"Failed to save checkpoint: {e}")
+    
+    # Export final submission
+    export_submission(all_tree_data, output_csv)
+    
+    total_score = calculate_total_score(side_lengths)
+    elapsed = time.time() - start_time
+    
+    if verbose:
+        logger.info("="*80)
+        logger.info("FINAL RESULTS")
+        logger.info("="*80)
+        logger.info(f"Total score: {total_score:.6f}")
+        logger.info(f"Total time: {elapsed/60:.1f} minutes")
+        logger.info(f"✓ Saved to: {output_csv}")
+    
+    # Clean up checkpoint
+    try:
+        Path(checkpoint_file).unlink()
+        if verbose:
+            logger.info(f"✓ Checkpoint cleaned up")
+    except:
+        pass
+    
+    return total_score
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Optimized SA')
+    parser.add_argument('--n', type=int, help='Optimize single n')
+    parser.add_argument('--iterations', type=int, default=100000)
+    parser.add_argument('--trials', type=int, default=10)
+    parser.add_argument('--full-submission', action='store_true')
+    parser.add_argument('--output', type=str, default='../submissions/sa_submission.csv')
+    
+    args = parser.parse_args()
+    
+    if args.full_submission:
+
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+
+        
+        checkpoint_file = args.output.replace('.csv', '_checkpoint.pkl')
+        
+        total_score = generate_sa_submission(
+            args.output,
+            iterations_small=args.iterations,
+            iterations_large=max(30000, args.iterations // 2),
+            trials=args.trials,
+            checkpoint_file=checkpoint_file
+        )
+        
+        scores_file = Path(args.output).parent / 'scores.txt'
+        with open(scores_file, 'a') as f:
+            from datetime import datetime
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"{Path(args.output).name}: {float(total_score):.6f} (optimized_sa) - {timestamp}\n")
+        
+        logger.info(f"✓ Score logged to: {scores_file}")
+        
+    elif args.n:
+        logger.info(f"Optimizing n={args.n}")
+        trees, score = optimize_with_multiple_trials(
+            args.n,
+            iterations=args.iterations,
+            trials=args.trials
+        )
+        
+        logger.info("")
+        logger.info("Tree positions:")
+        for i, tree in enumerate(trees):
+            logger.info(f"  {args.n:03d}_{i},s{float(tree.center_x):.6f},"
+                       f"s{float(tree.center_y):.6f},s{float(tree.angle):.1f}")
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
